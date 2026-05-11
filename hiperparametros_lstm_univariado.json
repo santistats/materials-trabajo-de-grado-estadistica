@@ -1,0 +1,8 @@
+{
+    "input_size": 1,
+    "hidden_size": 64,
+    "num_layers": 1,
+    "dropout": 0.0,
+    "learning_rate": 0.005,
+    "batch_size": 32
+}
