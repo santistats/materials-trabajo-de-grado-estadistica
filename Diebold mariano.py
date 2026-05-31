@@ -764,12 +764,50 @@ vars_to_diff_yeo = ["close", "DXY"]
 train_varx_diff = aplicar_diff(train_varx_yeo, vars_to_diff_yeo)
 print(f"Estos son los datos diferenciados: \n {train_varx_diff}")
 
-#Ajustar modelo final con el orden óptimo
+###Ajustamos el modelo VARX
+
 var_endo = ["close", "VIX", "RSI", "DXY"]
-var_exo = ["Regimen_Rt"]
-best_p = 2
-model_varx  = VAR(train_varx_diff[var_endo], exog=train_varx_diff[var_exo])
-varx_fitted = model_varx.fit(best_p)
+
+best_p_varx = 3
+best_s_varx = 2
+regime_col_varx = "Regimen_Rt"
+
+#Creamos R_{t-1}, ..., R_{t-s} para el conjunto de entrenamiento
+train_varx_model = train_varx_diff.copy()
+train_varx_model[regime_col_varx] = train_varx_model[regime_col_varx].astype(int)
+
+if best_s_varx < 1:
+    raise ValueError("El orden s de VARX debe ser >= 1 para usar solo rezagos disponibles.")
+
+for lag in range(1, best_s_varx + 1):
+    train_varx_model[f"{regime_col_varx}_L{lag}"] = (
+        train_varx_model[regime_col_varx].shift(lag)
+    )
+
+exog_cols_varx = [
+    f"{regime_col_varx}_L{lag}"
+    for lag in range(1, best_s_varx + 1)
+]
+
+#Eliminamos las primeras observaciones que quedan sin rezagos disponibles
+train_varx_model = train_varx_model.replace([np.inf, -np.inf], np.nan)
+train_varx_model = train_varx_model.dropna(
+    subset=var_endo + exog_cols_varx
+).copy()
+
+print("Modelo seleccionado: VARX(3,2)")
+print("Variables endógenas:", var_endo)
+print("Variables exógenas:", exog_cols_varx)
+print("Dimensión final de entrenamiento:", train_varx_model.shape)
+
+model_varx = VAR(
+    train_varx_model[var_endo],
+    exog=train_varx_model[exog_cols_varx]
+)
+
+varx_fitted = model_varx.fit(best_p_varx)
+
+print(varx_fitted.summary())
 
 ##Cargamos los modelos profundos con regimen
 var_pred_deep_reg = list(price_data.columns)
@@ -912,35 +950,54 @@ print("Prediciendo ARIMA...")
 arima_f_diff = model_final.forecast(steps=len(test_close))
 arima_idx = price_data.index[-len(arima_f_diff):]
 arima_f_box = train_close["train_boxcox"].iloc[-1] + arima_f_diff.cumsum()
-arima_p_real = pd.Series(inv_boxcox(arima_f_box, lambda_optim_close), index=arima_idx)
+arima_p_real = pd.Series(
+    np.asarray(inv_boxcox(arima_f_box, lambda_optim_close), dtype=float),
+    index=arima_idx
+)
 dict_predicciones['ARIMA'] = arima_p_real.loc[fechas_maestras].values
 
 ##VAR
-print("Prediciendo VAR estándar...")
-#Usamos el var_model entrenado anteriormente
+print("Prediciendo VAR...")
 var_f_diff = var_model.forecast(y=train_data.values[-p_opt:], steps=len(test_raw))
 var_idx = price_data.index[-len(var_f_diff):]
-
 var_f_box = train_box['close'].iloc[-1] + var_f_diff[:, 0].cumsum()
-var_p_real = pd.Series(inv_boxcox(var_f_box, dict_lanbda['close']), index=var_idx)
+var_p_real = pd.Series(
+    inv_boxcox(var_f_box, dict_lanbda['close']),
+    index=var_idx
+)
 dict_predicciones['VAR'] = var_p_real.loc[fechas_maestras].values
 
+
 #VARX
-print("Prediciendo VARX con régimen...")
-varx_f_diff = varx_fitted.forecast(y=train_varx_diff[var_endo].values[-best_p:], steps=len(test_varx), exog_future=test_varx[var_exo])
+print("Prediciendo VARX(3,2)...")
+regimen_total_varx = pd.concat([
+    train_varx_diff[[regime_col_varx]],
+    test_varx[[regime_col_varx]]
+]).copy()
+regimen_total_varx[regime_col_varx] = regimen_total_varx[regime_col_varx].astype(int)
+
+for lag in range(1, best_s_varx + 1):
+    regimen_total_varx[f"{regime_col_varx}_L{lag}"] = (
+        regimen_total_varx[regime_col_varx].shift(lag)
+    )
+
+test_exog_varx = regimen_total_varx.iloc[-len(test_varx):][exog_cols_varx].copy()
+forecast_input_varx = train_varx_model[var_endo].values[-best_p_varx:]
+varx_f_diff = varx_fitted.forecast(
+    y=forecast_input_varx,
+    steps=len(test_varx),
+    exog_future=test_exog_varx.values
+)
 varx_idx = price_data.index[-len(varx_f_diff):]
-varx_f_yeo = train_varx_yeo['close'].iloc[-1] + varx_f_diff[:, 0].cumsum()
-##Invertir Yeo Johnson
-varx_f_yeo_inv = inv_yeojohnson_scalar(varx_f_yeo, dict_lambdas_varx['close'])
-#Invertir Z score
-dummy_varx = np.zeros((len(varx_f_yeo_inv), scaler_reg.n_features_in_))
-dummy_varx[:, 0] = varx_f_yeo_inv
+varx_f_yeo = train_varx_yeo["close"].iloc[-1] + varx_f_diff[:, 0].cumsum()
+varx_f_z = inv_yeojohnson_scalar(varx_f_yeo, dict_lambdas_varx["close"])
+dummy_varx = np.zeros((len(varx_f_z), scaler_reg.n_features_in_))
+dummy_varx[:, 0] = varx_f_z
 varx_p_real = pd.Series(
     scaler_reg.inverse_transform(dummy_varx)[:, 0],
     index=varx_idx
 )
-dict_predicciones['VARX'] = varx_p_real.loc[fechas_maestras].values
-
+dict_predicciones["VARX"] = varx_p_real.loc[fechas_maestras].values
 
 ##Modelos profundos
 dl_models = {
@@ -963,15 +1020,43 @@ for name, (model, X_in, s_type) in dl_models.items():
     elif s_type == 'multi':
         dummy = np.zeros((len(preds), 4)); dummy[:, target_indices] = preds
         dict_predicciones[name] = scaler1.inverse_transform(dummy)[:, 0]
-    else: # multi_reg
+    else: 
         dummy = np.zeros((len(preds), 4)); dummy[:, target_indices_reg] = preds
         dict_predicciones[name] = scaler_reg.inverse_transform(dummy)[:, 0]
 
 ##matriz de comparación final: Diebold Mariano
 actual_values = price_data['close'].iloc[y_indices_test].values
 
+print("Número de fechas maestras:", len(fechas_maestras))
+print("NaN en valores reales:", np.isnan(actual_values).sum())
+
+for nombre, pred in dict_predicciones.items():
+    pred = np.asarray(pred)
+
+    print(
+        nombre,
+        "| longitud:", len(pred),
+        "| NaN:", np.isnan(pred).sum(),
+        "| Inf:", np.isinf(pred).sum()
+    )
+
+    assert len(pred) == len(actual_values), (
+        f"Longitud incompatible en {nombre}"
+    )
+    assert not np.isnan(pred).any(), (
+        f"Predicciones NaN en {nombre}"
+    )
+    assert not np.isinf(pred).any(), (
+        f"Predicciones Inf en {nombre}"
+    )
+
 print("\n---Calculando test de Diebold-Mariano---")
-df_pvalues, df_stats = matriz_diebold_mariano(actual_values, dict_predicciones)
+df_pvalues, df_stats = matriz_diebold_mariano(
+    actual_values,
+    dict_predicciones,
+    loss = "mse", 
+    h = 1
+)
 
 ##Heatmap
 plt.figure(figsize=(14, 12))

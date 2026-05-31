@@ -36,7 +36,6 @@ from tqdm import tqdm
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 
-
 plt.style.use('seaborn-v0_8-darkgrid')
 
 price_data = pd.read_excel(r"Datos proyecto.xlsx", index_col=0)
@@ -92,7 +91,6 @@ def stationarity_and_homoscedasticity_tests(
         bp_stat = bp_test[0]
         bp_pvalue = bp_test[1]
         homocedastica = bp_pvalue > alpha
-# 
         results.append({
             "Variable": col,
             "ADF estadístico": round(adf_stat, 4),
@@ -175,7 +173,7 @@ def buscar_mejor_arima(train_series, max_p=3, max_q=3):
 
 mejor_p_q, resultados_win = buscar_mejor_arima(train_close["close_boxcox_diff"], max_p=4, max_q=4)
 
-mejor_order = (0, 0, 0) 
+mejor_order = (0, 0, 0) ##En el trbajo es d= 1 porque el orden se halló con los datos diferenciados
 model_final = ARIMA(train_close["close_boxcox_diff"], order=mejor_order).fit()
 print(model_final.summary())
 
@@ -274,7 +272,7 @@ fitted_boxcox = train_close["train_boxcox"].iloc[:train_size_close].shift(1) + f
 fitted_final = inv_boxcox(fitted_boxcox, lambda_optim_close)
 
 
-plt.figure(figsize=(15, 7))
+plt.figure(figsize=(12, 6))
 plt.plot(full_index, close['close'], label='Observaciones reales', color='lightgray', alpha=0.8, linewidth=1.5)
 plt.plot(train_index, fitted_final, label='Ajuste en entrenamiento', color='forestgreen', linestyle=':', alpha=0.7)
 plt.plot(test_index, forecast_final, label='Predicción para prueba', color='darkorange', linewidth=2.5)
@@ -286,7 +284,6 @@ plt.legend(loc='upper left', frameon=True)
 plt.grid(alpha=0.2)
 plt.tight_layout()
 plt.show()
-
 
 ###Modelo VAR
 
@@ -385,10 +382,25 @@ max_lags= 12
 var_model = VAR(train_data)
 var_model = var_model.fit(p_opt)
 
-##Sacamos el intercepto
+##Sacamos el vector de medias 
 delta = var_model.intercept
-print("\nVector Intercepto (delta):")
-print(delta)
+Phi_sum = np.sum(var_model.coefs, axis=0)
+mu_hat = np.linalg.inv(np.eye(len(delta)) - Phi_sum) @ delta
+
+print("Vector de medias incondicionales estimado:")
+print(mu_hat)
+
+#Las matrices de coeficientes (Phi_1, Phi_2, ..., Phi_10)
+#var_model.coefs devuelve un array de forma (lags, k, k)
+coefs_matrices = var_model.coefs
+Phi_1 = coefs_matrices[0]
+Phi_2 = coefs_matrices[1]
+
+print("Matriz Phi_1:")
+print(Phi_1)
+
+print("Matriz Phi_2:")
+print(Phi_2)
 
 ##Validamos residuos
 validate_residuals(var_model.resid)
@@ -1831,7 +1843,6 @@ plt.ylabel("Inercia")
 plt.grid(alpha=0.3)
 plt.show()
 
-
 for k in range(2,6):
     km = KMeans(n_clusters=k, random_state=1, n_init=10)
     labels = km.fit_predict(train_scaled_reg)
@@ -2014,85 +2025,223 @@ vars_to_diff_yeo = ["close", "DXY"]
 train_varx_diff = aplicar_diff(train_varx_yeo, vars_to_diff_yeo)
 print(f"Estos son los datos diferenciados: \n {train_varx_diff}")
 
+train_varx_diff["Regimen_Rt"] = train_varx_diff["Regimen_Rt"].astype(int)
+
 stationarity_and_homoscedasticity_tests(train_varx_diff)
 
 ##Funcion para mejor orden
 
-def select_varx_order(train_endog, train_exog, max_lags=15, verbose=True):
+def select_varx_order_ps(
+    train_df: pd.DataFrame,
+    endog_cols: list[str],
+    regime_col: str = "Regimen_Rt",
+    max_p: int = 12,
+    max_s: int = 5,
+    verbose: bool = True
+):
     """
-    Selecciona el orden de rezago óptimo para VARX mediante AIC,
-    usando exclusivamente el conjunto de entrenamiento.
-    
-    Parámetros:
-    -----------
-    train_endog : DataFrame con las variables endógenas
-    train_exog  : DataFrame o array con la variable exógena
-    max_lags    : Número máximo de rezagos a evaluar
-    verbose     : Imprimir tabla de resultados
-    
-    Retorna:
-    --------
-    best_p      : Orden óptimo según AIC
-    results_df  : DataFrame con AIC por cada rezago evaluado
+    Selecciona conjuntamente los órdenes (p, s) de un modelo VARX(p, s)
+    mediante AIC, utilizando exclusivamente el conjunto de entrenamiento.
+
+    Definición utilizada:
+        Y_t = delta + sum_{j=1}^{p} Phi_j Y_{t-j} + sum_{i=1}^{s} Theta_i R_{t-i} + a_t
+    Por tanto:
+        s = 1  -> usa R_{t-1}
+        s = 2  -> usa R_{t-1}, R_{t-2}
+        s = 3  -> usa R_{t-1}, R_{t-2}, R_{t-3}
+        ...
+    Todos los modelos candidatos se evalúan sobre una muestra común
+    para que sus AIC sean comparables.
     """
+    required_cols = endog_cols + [regime_col]
+    missing_cols = [col for col in required_cols if col not in train_df.columns]
+    if missing_cols:
+        raise ValueError(f"Faltan columnas requeridas: {missing_cols}")
+
+    work = train_df[required_cols].copy()
+    work = work.replace([np.inf, -np.inf], np.nan)
+    work = work.apply(pd.to_numeric, errors="coerce")
+
+    #Para construir R_{t-1}, R_{t-2}, ..., R_{t-max_s}
+    for lag in range(1, max_s + 1):
+        work[f"{regime_col}_L{lag}"] = work[regime_col].shift(lag)
+
+    all_exog_cols = [f"{regime_col}_L{lag}" for lag in range(1, max_s + 1)]
+
+    #Muestra común para comparar AIC entre distintos valores de s
+    common_data = work.dropna(subset=endog_cols + all_exog_cols).copy()
+
+    if common_data.empty:
+        raise ValueError(
+            "La muestra común quedó vacía. Revise los datos o reduzca max_s."
+        )
+
+    if verbose:
+        print("Diagnóstico de muestra común:")
+        print(f"Observaciones disponibles: {len(common_data)}")
+        print("NaN en endógenas:", common_data[endog_cols].isna().sum().sum())
+        print("NaN en exógenas:", common_data[all_exog_cols].isna().sum().sum())
+        print()
+        print(f"{'p':<5} | {'s':<5} | {'AIC':<15} | {'Mejor':<6}")
+        print("-" * 42)
+
     results = []
-    best_aic = float('inf')
-    best_p   = 1
+    best_aic = np.inf
+    best_p = None
+    best_s = None
+    best_exog_cols = None
+
+    endog = common_data[endog_cols]
+
+    for s in range(1, max_s + 1):
+        exog_cols = [f"{regime_col}_L{lag}" for lag in range(1, s + 1)]
+        exog = common_data[exog_cols]
+
+        for p in range(1, max_p + 1):
+            try:
+                fitted = VAR(endog, exog=exog).fit(p)
+                aic = fitted.aic
+
+                is_best = aic < best_aic
+                if is_best:
+                    best_aic = aic
+                    best_p = p
+                    best_s = s
+                    best_exog_cols = exog_cols.copy()
+
+                results.append({
+                    "p": p,
+                    "s": s,
+                    "aic": aic,
+                    "nobs": fitted.nobs,
+                    "exog_cols": ", ".join(exog_cols)
+                })
+
+                if verbose:
+                    marker = "  ◄" if is_best else ""
+                    print(f"{p:<5} | {s:<5} | {aic:<15.6f} | {marker}")
+
+            except Exception as e:
+                if verbose:
+                    print(f"{p:<5} | {s:<5} | Error: {e}")
+
+    results_df = pd.DataFrame(results).sort_values("aic").reset_index(drop=True)
+
+    if best_p is None:
+        raise RuntimeError(
+            "No fue posible estimar ningún modelo candidato VARX(p,s)."
+        )
 
     if verbose:
-        print(f"{'p':<5} | {'AIC':<15} | {'Mejor':<6}")
-        print("-" * 32)
+        print("-" * 42)
+        print(
+            f"Orden óptimo seleccionado: VARX({best_p},{best_s}) "
+            f"con AIC = {best_aic:.6f}"
+        )
+        print(f"Variables exógenas utilizadas: {best_exog_cols}")
 
-    for p in range(1, max_lags + 1):
-        try:
-            model       = VAR(train_endog, exog=train_exog)
-            model_fitted = model.fit(p)
-            aic          = model_fitted.aic
+    return best_p, best_s, best_exog_cols, results_df
 
-            is_best = aic < best_aic
-            if is_best:
-                best_aic = aic
-                best_p   = p
-
-            results.append({'p': p, 'aic': aic})
-
-            if verbose:
-                marker = '  ◄' if is_best else ''
-                print(f"{p:<5} | {aic:<15.4f} | {marker}")
-
-        except Exception as e:
-            if verbose:
-                print(f"{p:<5} | Error: {e}")
-            continue
-
-    if verbose:
-        print("-" * 32)
-        print(f"Orden óptimo: p = {best_p}  (AIC: {best_aic:.4f})")
-
-    results_df = pd.DataFrame(results).set_index('p')
-    return best_p, results_df
-
-train_varx_diff["Regimen_Rt"] = train_varx_diff["Regimen_Rt"].astype(int)
-
+##Hacemos la busqueda
 var_endo = ["close", "VIX", "RSI", "DXY"]
-var_exo = ["Regimen_Rt"]
-best_p, aic_table = select_varx_order(
-    train_endog = train_varx_diff[var_endo],   
-    train_exog  = train_varx_diff[var_exo],    
-    max_lags    = 15,
-    verbose     = True
+
+best_p, best_s, best_exog_cols, aic_table = select_varx_order_ps(
+    train_df=train_varx_diff,
+    endog_cols=var_endo,
+    regime_col="Regimen_Rt",
+    max_p=12,
+    max_s=5,
+    verbose=True
 )
 
-#Ajustamos con p optimo
-model_varx  = VAR(train_varx_diff[var_endo], exog=train_varx_diff[var_exo])
+print("\nCinco mejores especificaciones:")
+print(aic_table.head())
+
+def preparar_varx_final(df, endog_cols, regime_col="Regimen_Rt", s=1):
+    data = df[endog_cols + [regime_col]].copy()
+    data = data.replace([np.inf, -np.inf], np.nan)
+    data = data.apply(pd.to_numeric, errors="coerce")
+
+    if s < 1:
+        raise ValueError("El orden s debe ser >= 1 para usar solo rezagos disponibles.")
+
+    for lag in range(1, s + 1):
+        data[f"{regime_col}_L{lag}"] = data[regime_col].shift(lag)
+
+    exog_cols = [f"{regime_col}_L{lag}" for lag in range(1, s + 1)]
+
+    data = data.dropna(subset=endog_cols + exog_cols)
+
+    return data[endog_cols], data[exog_cols], exog_cols
+
+
+##Reconstruimos índices
+
+n_train_varx = len(train_varx)
+n_test_varx  = len(test_final)
+
+idx_train_varx = price_data.index[:n_train_varx]
+idx_test_varx  = price_data.index[n_train_varx:n_train_varx + n_test_varx]
+
+train_varx_diff_dated = train_varx_diff.copy()
+train_varx_diff_dated.index = idx_train_varx[
+    len(idx_train_varx) - len(train_varx_diff_dated):
+]
+
+test_final_dated = test_final.copy()
+test_final_dated.index = idx_test_varx
+
+print("Train fechado:", train_varx_diff_dated.index[:3])
+print("Test fechado :", test_final_dated.index[:3])
+
+##Ajustamos el modelo
+train_endog_model, train_exog_model, exog_cols = preparar_varx_final(
+    train_varx_diff_dated,
+    endog_cols=var_endo,
+    regime_col="Regimen_Rt",
+    s=best_s
+)
+
+print("Exógenas finales:", exog_cols)
+print("Train endógeno :", train_endog_model.shape)
+print("Train exógeno  :", train_exog_model.shape)
+print("Índice train modelo:", train_endog_model.index[:3])
+
+
+model_varx = VAR(train_endog_model, exog=train_exog_model)
 varx_fitted = model_varx.fit(best_p)
+
 print(varx_fitted.summary())
+
+print("Intercepto:")
+print(varx_fitted.intercept)
+
+print("Coeficientes exógenos:")
+print(varx_fitted.coefs_exog)
+
+print("Coeficientes autorregresivos:")
+for j, Phi_j in enumerate(varx_fitted.coefs, start=1):
+    print(f"Phi_{j}:")
+    print(Phi_j)
+
+##Construimos exogenas
+
+regimen_total = pd.concat([
+    train_varx_diff_dated[["Regimen_Rt"]],
+    test_final_dated[["Regimen_Rt"]]
+]).sort_index()
+
+for lag in range(0, best_s + 1):
+    regimen_total[f"Regimen_Rt_L{lag}"] = regimen_total["Regimen_Rt"].shift(lag)
+
+test_exog_lags = regimen_total.loc[test_final_dated.index, exog_cols].copy()
+
+print(test_exog_lags.head())
+print("NaN en exógenas test:")
+print(test_exog_lags.isna().sum())
 
 #Validamos residuos
 validate_residuals(varx_fitted.resid)
-print(f"Etse es el vector de intercepto: \n {varx_fitted.intercept}")
-
-print(f"Coeficientes de la exógena (Regimen_Rt): \n {varx_fitted.coefs_exog}")
 
 #para graficar métrica
 
@@ -2100,23 +2249,24 @@ def evaluate_varx(
     varx_fitted,
     train_varx_diff,
     test_final_dated,
+    test_exog_lags,
     price_data,
     scaler_reg,
     dict_lambdas_varx,
     var_endo,
-    var_exo,
     vars_to_diff,
     vars_to_yeo,
     best_p,
-    figsize=(15, 6)
+    figsize=(12, 6)
 ):
     """
     Evalúa VARX invirtiendo el pipeline completo:
     Diferenciación → Yeo-Johnson → Z-score
     """
+    from scipy import stats
 
-    n_features   = scaler_reg.n_features_in_
-    col_names    = list(price_data.columns)  #orden original del scaler
+    n_features = scaler_reg.n_features_in_
+    col_names = list(price_data.columns)  #orden original del scaler
 
     def inv_zscore(series, col):
         """Invierte Z-score para una sola columna."""
@@ -2129,22 +2279,21 @@ def evaluate_varx(
         )
 
     def inv_yeojohnson(series, lmbda):
-        """Invierte Yeo-Johnson"""
-        y   = series.values
-        x   = np.zeros_like(y, dtype=float)
+        y = series.values
+        x  = np.zeros_like(y, dtype=float)
         eps = 1e-8
         pos = y >= 0
         neg = ~pos
 
-        if abs(lmbda) > eps:
-            x[pos] = np.power(np.maximum(y[pos] * lmbda + 1, 0), 1/lmbda) - 1
+        if abs(lmbda)>eps:
+            x[pos] = np.power(np.maximum(y[pos]*lmbda + 1, 0), 1/lmbda) - 1
         else:
             x[pos] = np.exp(y[pos]) - 1
 
-        if abs(lmbda - 2) > eps:
-            x[neg] = 1 - np.power(np.maximum(-(2 - lmbda) * y[neg] + 1, 0), 1/(2 - lmbda))
+        if abs(lmbda- 2) > eps:
+            x[neg]= 1 -np.power(np.maximum(-(2 - lmbda)*y[neg] + 1, 0), 1/(2 - lmbda))
         else:
-            x[neg] = 1 - np.exp(-y[neg])
+            x[neg] = 1- np.exp(-y[neg])
 
         return pd.Series(x, index=series.index)
 
@@ -2168,8 +2317,9 @@ def evaluate_varx(
         result = series.copy()
         col_idx = col_names.index(col)
 
-        #Invertir diferenciación (si aplica)
+        #Invertir diferenciación (si sí)
         if is_diff:
+            #Calcular serie Ancla (Z-Score -> Yeo)
             raw_col = price_data[col]
             z_col = (raw_col - scaler_reg.mean_[col_idx]) / scaler_reg.scale_[col_idx]
             
@@ -2180,7 +2330,7 @@ def evaluate_varx(
                 
             result = inv_diff(result, anchor_series, is_forecast)
 
-        #Invertir Yeo-Johnson (si aplica)
+        #Invertir Yeo-Johnson (si sí)
         if is_yeo and col in dict_lambdas_varx:
             result = inv_yeojohnson(result, dict_lambdas_varx[col])
 
@@ -2189,7 +2339,7 @@ def evaluate_varx(
 
         return result
 
-    #Preparar test transformado
+    #Para preparar test transformado
     def apply_yeo_fixed(series, lmbda):
         """Aplica Yeo-Johnson con lambda fijo."""
         y   = series.values
@@ -2207,39 +2357,60 @@ def evaluate_varx(
             x[neg] = -np.log(-y[neg] + 1)
         return pd.Series(x, index=series.index)
 
-    #Aplicar Yeo-Johnson al test con lambdas de train
+    #Para aplicar Yeo-Johnson al test con lambdas de train
     test_yeo = test_final_dated.copy()
     for col in vars_to_yeo:
         test_yeo[col] = apply_yeo_fixed(test_yeo[col], dict_lambdas_varx[col])
 
-    #Diferenciar columnas que corresponde
+    #Para diferenciar columnas que corresponde
     test_diff = test_yeo.copy()
+
     for col in vars_to_diff:
         test_diff[col] = test_diff[col].diff()
-    test_diff = test_diff.dropna()
+
+    test_diff = test_diff.dropna().copy()
     test_diff["Regimen_Rt"] = test_diff["Regimen_Rt"].astype(int)
 
-    forecast_input = train_varx_diff[var_endo].values[-best_p:]
-    exog_test      = test_diff[var_exo].values
+    #Pronóstico fuera de muestra
+
+    #Últimas observaciones endógenas realmente utilizadas por el modelo
+    forecast_input = train_varx_diff[var_endo].iloc[-best_p:].to_numpy()
+
+    #test_diff pierde la primera fila por diferenciación;
+    #las exógenas deben quedar exactamente alineadas con ese índice.
+    exog_test = test_exog_lags.reindex(test_diff.index).copy()
+
+    if exog_test.isna().any().any():
+        raise ValueError(
+            "Las variables exógenas de prueba contienen NaN después de alinearlas "
+            "con test_diff. Revisa los índices de train/test."
+        )
+
+    if len(exog_test) != len(test_diff):
+        raise ValueError(
+            f"Longitudes incompatibles: test_diff={len(test_diff)}, "
+            f"exog_test={len(exog_test)}."
+        )
 
     forecast_arr = varx_fitted.forecast(
-        y           = forecast_input,
-        steps       = len(test_diff),
-        exog_future = exog_test
+        y=forecast_input,
+        steps=len(test_diff),
+        exog_future=exog_test.to_numpy()
     )
 
     df_forecast = pd.DataFrame(
         forecast_arr,
-        index   = test_diff.index,
-        columns = var_endo
+        index=test_diff.index,
+        columns=var_endo
     )
 
-    #Ajuste in-sample
-    fitted_vals = varx_fitted.fittedvalues.copy()
-    fitted_vals.index = train_varx_diff.index[
-        len(train_varx_diff) - len(fitted_vals):
-    ]
+    #Ajuste en muestra
 
+    fitted_vals = varx_fitted.fittedvalues.copy()
+
+    #El modelo ya fue ajustado con índice de fechas;
+    #por seguridad, se fuerza la misma alineación temporal de la muestra usada.
+    fitted_vals.index = train_varx_diff.index[-len(fitted_vals):]
     #Métricas y gráficos por variable
     metrics_all = {}
 
@@ -2248,10 +2419,10 @@ def evaluate_varx(
         is_yeo  = col in vars_to_yeo
 
         #Invertir ajuste train (is_forecast = False)
-        fitted_real   = full_invert(fitted_vals[col],   col, is_diff, is_yeo, is_forecast=False)
+        fitted_real   = full_invert(fitted_vals[col], col, is_diff, is_yeo, is_forecast=False)
 
         #Invertir pronóstico test (is_forecast = True)
-        forecast_real = full_invert(df_forecast[col],   col, is_diff, is_yeo, is_forecast=True)
+        forecast_real = full_invert(df_forecast[col],col, is_diff, is_yeo, is_forecast=True)
 
         #Valores reales en escala original
         y_true = price_data[col].loc[test_diff.index]
@@ -2261,11 +2432,11 @@ def evaluate_varx(
         y_true = y_true.loc[common]
         y_pred = y_pred.loc[common]
 
-        mse  = mean_squared_error(y_true, y_pred)
+        mse = mean_squared_error(y_true, y_pred)
         rmse = np.sqrt(mse)
-        mae  = mean_absolute_error(y_true, y_pred)
+        mae= mean_absolute_error(y_true, y_pred)
         mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-        r2   = r2_score(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
 
         metrics_all[col] = {
             'MSE': mse, 'RMSE': rmse,
@@ -2280,27 +2451,33 @@ def evaluate_varx(
         print(f"  MAPE : {mape:.2f}%")
         print(f"  R2   : {r2:.4f}")
 
+        ##Gráfico
+
         fig, ax = plt.subplots(figsize=figsize, dpi=100)
 
         ax.plot(price_data.index, price_data[col],
                 color='lightgray', linewidth=1.5, alpha=0.8,
-                label=f'Observaciones reales', zorder=1)
+                label=f'Precio real ({col})', zorder=1)
 
         ax.plot(fitted_real.index, fitted_real,
                 color='forestgreen', linestyle=':', linewidth=1.2,
-                alpha=0.8, label='Ajuste en entrenamiento', zorder=2)
+                alpha=0.8, label='Ajuste VARX (Train)', zorder=2)
 
         ax.axvline(x=test_diff.index[0],
                    color='red', linestyle='--',
                    linewidth=1.5, alpha=0.6,
-                   label='Inicio de prueba', zorder=3)
+                   label='Inicio del Test', zorder=3)
 
         ax.plot(forecast_real.index, forecast_real,
                 color='darkorange', linewidth=2.2,
-                label='Predicción para prueba', zorder=4)
+                label='Predicción VARX (Test)', zorder=4)
 
+        ax.set_title(
+            f'Ajuste y predicciones del modelo VARX — {col}',
+            fontsize=14, fontweight='bold', pad=15, color='#2C3E50'
+        )
         ax.set_xlabel('Tiempo', fontsize=12, labelpad=8)
-        #ax.set_ylabel(col, fontsize=12, labelpad=8)
+        ax.set_ylabel(col, fontsize=12, labelpad=8)
         ax.legend(loc='upper left', frameon=True,
                   fancybox=True, shadow=True,
                   fontsize=10, framealpha=0.95)
@@ -2312,31 +2489,20 @@ def evaluate_varx(
 
     return metrics_all, df_forecast
 
-##Reconstruimos indices
-n_train_varx = len(train_varx)  #80% (train_final + val_final concatenados)
-n_test_varx  = len(test_final)
-
-idx_train_varx = price_data.index[:n_train_varx]
-idx_test_varx  = price_data.index[n_train_varx:]
-
-#fechas reales
-train_varx_diff.index = idx_train_varx[len(idx_train_varx) - len(train_varx_diff):]
-test_final_dated      = test_final.copy()
-test_final_dated.index = idx_test_varx
 
 metrics_varx, forecast_varx = evaluate_varx(
-    varx_fitted       = varx_fitted,
-    train_varx_diff   = train_varx_diff,
+    varx_fitted    = varx_fitted,
+    train_varx_diff  = train_endog_model,
     test_final_dated  = test_final_dated,
-    price_data        = price_data,
-    scaler_reg        = scaler_reg,      
+    test_exog_lags  = test_exog_lags,
+    price_data    = price_data,
+    scaler_reg = scaler_reg,
     dict_lambdas_varx = dict_lambdas_varx,
-    var_endo          = var_endo,
-    var_exo           = var_exo,
-    vars_to_diff      = vars_to_diff_yeo,
+    var_endo       = var_endo,
+    vars_to_diff     = vars_to_diff_yeo,
     vars_to_yeo       = vars_to_yeo_reg,
     best_p            = best_p,
-    figsize           = (12, 6)
+    figsize = (12, 6)
 )
 
 
